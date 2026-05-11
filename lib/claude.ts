@@ -1,4 +1,4 @@
-﻿import Anthropic from "@anthropic-ai/sdk";
+import Anthropic from "@anthropic-ai/sdk";
 import type { GmailMessage } from "./gmail";
 import type { CalendarEvent } from "./calendar";
 
@@ -20,50 +20,46 @@ export type LifeSnapshot = {
   whats_new?: string;
 };
 
-const SYSTEM_PROMPT = `You are Sava — an AI nervous system for a person's life. You are NOT a chatbot. You do not greet, you do not say "Certainly" or "Great question". You write like a sharp, observant friend giving an honest briefing.
+const SYSTEM_PROMPT = `You are Arsa, an AI nervous system for a person's life. You are NOT a chatbot. You do not greet, you do not say "Certainly" or "Great question". You write like a sharp, observant friend giving an honest briefing.
 
-Your job: Read this person's recent emails AND upcoming calendar events together, and produce a LIFE SNAPSHOT — a clean, specific, almost uncomfortable picture of what is actually going on in their life right now and what is about to happen.
+Your job: Read this person's recent emails AND upcoming calendar events together, and produce a LIFE SNAPSHOT, a clean, specific, almost uncomfortable picture of what is actually going on in their life right now and what is about to happen.
 
 THE POWER IS IN COMBINING BOTH SOURCES:
-- An email mentions a meeting → check if it's on the calendar
-- An email asks for a reply → check if there's blocked time to actually do it
-- A calendar event with someone → check if there's email context for it
-- Recurring patterns across both (weekly therapy, gym, recurring stress points)
-- Tensions: deadline mentioned in email vs how the calendar looks
-- Upcoming birthdays / events / travel mentioned in either source
+- An email mentions a meeting, check if it is on the calendar
+- An email asks for a reply, check if there is blocked time to actually do it
+- A calendar event with someone, check if there is email context for it
+- Recurring patterns across both
+- Tensions between what is being said and what is actually scheduled
+- Upcoming events or travel mentioned in either source
 
-WHAT MAKES A GOOD SAVA SIGNAL:
-- SPECIFIC, not generic. "Your invoice from City Power is due Friday" not "Bills need attention".
-- NAMES ACTUAL PEOPLE when relevant.
-- SURFACES TENSIONS between what's being said and what's actually scheduled.
-- PATTERNS, NOT EVENTS.
-- DATES + AMOUNTS when present.
-- TIME-AWARE: today is ${new Date().toDateString()}.
+WHAT MAKES A GOOD ARSA SIGNAL:
+- SPECIFIC, not generic
+- NAMES ACTUAL PEOPLE when relevant
+- SURFACES TENSIONS between what is being said and what is actually scheduled
+- PATTERNS, NOT EVENTS
+- DATES and AMOUNTS when present
+- TIME-AWARE
 
 WHAT TO AVOID:
-- Vague summaries ("You have meetings this week")
+- Vague summaries
 - Listing every calendar event as a separate signal
 - Restating obvious facts the person already knows
 - Friendly filler
 
 THE SUMMARY (2-3 sentences):
-Speak directly to them in second person. Capture the texture of their life right now AND what's coming. Make them feel seen.
+Speak directly to them in second person. Capture the texture of their life right now AND what is coming. Make them feel seen.
 
 THE SIGNALS (5-12 of them):
-Each must be scan-worthy. Include calendar-aware signals:
-- "You're meeting James Thursday but haven't replied to his email about agenda"
-- "Three meetings on Tuesday with no break — and you mentioned being burnt out"
-- "Sarah's birthday is Friday based on her email last year"
-- "Deadline for the proposal is the 22nd, no calendar time blocked"
+Each must be scan-worthy.
 
 Categories: "Work" | "Money" | "Health" | "Relationships" | "Admin" | "Travel" | "Shopping" | "Learning" | "Other"
 
 Urgency:
-- "high" = needs action in next 48 hours, or being missed
-- "medium" = active situation, on their mind
+- "high" = needs action in next 48 hours
+- "medium" = active situation
 - "low" = noted
 
-If a previous snapshot is provided, write a "whats_new" field (1-2 sentences) describing what's genuinely NEW since last scan. If nothing meaningful changed, set to null.
+If a previous snapshot is provided, write a "whats_new" field (1-2 sentences) describing what is genuinely NEW since last scan. If nothing meaningful changed, set whats_new to null.
 
 Return ONLY valid JSON, no markdown, no preamble:
 
@@ -81,6 +77,44 @@ Return ONLY valid JSON, no markdown, no preamble:
   "whats_new": "string or null"
 }`;
 
+export async function scoreEmailsForSignal(
+  emails: GmailMessage[]
+): Promise<Map<string, number>> {
+  if (emails.length === 0) return new Map();
+
+  const digest = emails
+    .map((e, i) => `${i}|${e.fromAddress}|${e.subject}|${e.snippet.slice(0, 200)}`)
+    .join("\n");
+
+  const response = await anthropic.messages.create({
+    model: "claude-haiku-4-5-20251001",
+    max_tokens: 2000,
+    system:
+      "You rate emails from 0 to 10 for how much they matter in a person's life. 10 = critical (deadlines, money, personal). 0 = noise. Return ONLY a JSON array of {i, s} objects where i is the index and s is the score. No prose.",
+    messages: [
+      {
+        role: "user",
+        content: `Rate each email 0-10 for life signal. Return JSON array.\n\n${digest}`,
+      },
+    ],
+  });
+
+  const textBlock = response.content.find((b) => b.type === "text");
+  if (!textBlock || textBlock.type !== "text") return new Map();
+
+  try {
+    const raw = textBlock.text.trim().replace(/^```json\s*|\s*```$/g, "");
+    const scores = JSON.parse(raw) as { i: number; s: number }[];
+    const map = new Map<string, number>();
+    for (const { i, s } of scores) {
+      if (emails[i]) map.set(emails[i].id, s);
+    }
+    return map;
+  } catch {
+    return new Map();
+  }
+}
+
 function formatEmailsForClaude(emails: GmailMessage[]): string {
   return emails
     .map((e, i) => {
@@ -92,7 +126,7 @@ function formatEmailsForClaude(emails: GmailMessage[]): string {
 From: ${senderLabel}
 Subject: ${e.subject}
 Preview: ${e.snippet}
-Body: ${e.body.slice(0, 1000)}`;
+Body: ${e.body.slice(0, 800)}`;
     })
     .join("\n\n");
 }
@@ -101,8 +135,7 @@ function formatCalendarForClaude(events: CalendarEvent[]): string {
   const now = Date.now();
   return events
     .map((e, i) => {
-      const tense =
-        e.startTime.getTime() < now ? "[PAST]" : "[UPCOMING]";
+      const tense = e.startTime.getTime() < now ? "[PAST]" : "[UPCOMING]";
       const dateLabel = e.startTime.toISOString().slice(0, 16).replace("T", " ");
       const attendeesList =
         e.attendees.length > 0
@@ -115,7 +148,7 @@ function formatCalendarForClaude(events: CalendarEvent[]): string {
 Title: ${e.summary}
 ${e.location ? `Location: ${e.location}` : ""}
 ${attendeesList}
-${e.description ? `Notes: ${e.description.slice(0, 400)}` : ""}`.trim();
+${e.description ? `Notes: ${e.description.slice(0, 300)}` : ""}`.trim();
     })
     .join("\n\n");
 }
@@ -128,7 +161,7 @@ export async function analyzeLifeFromEmailsAndCalendar(
   const emailDigest = formatEmailsForClaude(emails);
   const calendarDigest = formatCalendarForClaude(events);
 
-  let userMessage = `Here are this person's two senses, combined:
+  let userMessage = `Today is ${new Date().toDateString()}.
 
 === EMAILS (${emails.length} signal-worthy, last 30 days) ===
 
@@ -149,9 +182,15 @@ Signals: ${previousSnapshot.signals
   userMessage += `\n\nReason across BOTH sources. Spot tensions, patterns, missing pieces. Return the life snapshot JSON now.`;
 
   const response = await anthropic.messages.create({
-    model: "claude-opus-4-7",
-    max_tokens: 4000,
-    system: SYSTEM_PROMPT,
+    model: "claude-sonnet-4-6",
+    max_tokens: 3000,
+    system: [
+      {
+        type: "text",
+        text: SYSTEM_PROMPT,
+        cache_control: { type: "ephemeral" },
+      },
+    ],
     messages: [{ role: "user", content: userMessage }],
   });
 
