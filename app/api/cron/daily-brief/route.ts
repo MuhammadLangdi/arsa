@@ -18,15 +18,33 @@ const resend = new Resend(process.env.RESEND_API_KEY!);
 export const maxDuration = 300;
 
 export async function GET(request: NextRequest) {
-  // Verify this is Vercel Cron or our manual trigger
   const authHeader = request.headers.get("authorization");
-  if (authHeader !== `Bearer ${process.env.CRON_SECRET}`) {
+  const expectedSecret = process.env.CRON_SECRET;
+
+  // Diagnostic logging (safe: we log lengths, not values)
+  console.log("[cron] Auth check:", {
+    hasAuthHeader: !!authHeader,
+    authHeaderStartsWithBearer: authHeader?.startsWith("Bearer ") || false,
+    receivedSecretLength: authHeader?.replace("Bearer ", "").length || 0,
+    expectedSecretLength: expectedSecret?.length || 0,
+    expectedSecretSet: !!expectedSecret,
+  });
+
+  if (!expectedSecret) {
+    console.error("[cron] CRON_SECRET env var is not set in production");
+    return NextResponse.json(
+      { error: "Server not configured" },
+      { status: 500 }
+    );
+  }
+
+  if (authHeader !== `Bearer ${expectedSecret}`) {
+    console.error("[cron] Auth header did not match");
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
   console.log("[cron] Starting daily brief run");
 
-  // Get all users with daily brief enabled who have not received one today
   const today = new Date();
   today.setHours(0, 0, 0, 0);
 
@@ -40,7 +58,6 @@ export async function GET(request: NextRequest) {
     return NextResponse.json({ error: "Failed to fetch users" }, { status: 500 });
   }
 
-  // Filter out users who already got today's brief
   const targetUsers = users.filter((u) => {
     if (!u.last_brief_sent_at) return true;
     return new Date(u.last_brief_sent_at) < today;
@@ -51,12 +68,10 @@ export async function GET(request: NextRequest) {
   let succeeded = 0;
   let failed = 0;
 
-  // Process sequentially to avoid hammering Gmail/Calendar APIs
   for (const user of targetUsers) {
     try {
       console.log(`[cron] Processing ${user.email}`);
 
-      // Fetch fresh data
       await Promise.all([
         fetchAndStoreEmails(user.id, { maxResults: 200, daysBack: 30 }),
         fetchAndStoreCalendarEvents(user.id, { daysBack: 14, daysForward: 30 }),
@@ -96,7 +111,6 @@ export async function GET(request: NextRequest) {
         previousSnapshot || null
       );
 
-      // Save snapshot
       const { data: savedSnapshot } = await supabaseAdmin
         .from("life_snapshots")
         .insert({
@@ -109,17 +123,14 @@ export async function GET(request: NextRequest) {
         .select()
         .single();
 
-      // Generate brief content
       const brief = await writeDailyBrief(snapshot);
 
-      // Render email HTML
       const html = renderDailyBriefEmail(
         brief,
         user.name || "friend",
         `${process.env.NEXT_PUBLIC_APP_URL}/dashboard`
       );
 
-      // Send via Resend
       await resend.emails.send({
         from: "Arsa <onboarding@resend.dev>",
         to: user.email,
@@ -127,7 +138,6 @@ export async function GET(request: NextRequest) {
         html,
       });
 
-      // Record the brief
       await supabaseAdmin.from("daily_briefs").insert({
         user_id: user.id,
         snapshot_id: savedSnapshot?.id || null,
@@ -136,7 +146,6 @@ export async function GET(request: NextRequest) {
         email_html: html,
       });
 
-      // Mark user as sent today
       await supabaseAdmin
         .from("users")
         .update({ last_brief_sent_at: new Date().toISOString() })
